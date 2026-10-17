@@ -1,22 +1,101 @@
 import time
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request as URLRequest, urlopen
 
 from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.database import get_db
+from app.database import SessionLocal, get_db
 from app.models import CheckResult, Service
 
+from prometheus_client import (
+    Counter,
+    Gauge,
+    Histogram,
+    generate_latest,
+)
+from prometheus_client import CONTENT_TYPE_LATEST
+from fastapi import Request, Response
+import logging
+
+from apscheduler.schedulers.background import BackgroundScheduler
+
+
+logging.basicConfig(level=logging.INFO)
+
+logger = logging.getLogger(__name__)
+
+scheduler = BackgroundScheduler()
 
 app = FastAPI(
     title="Service Monitor",
     description="HTTP/HTTPS service monitoring API",
     version="0.4.0",
 )
+
+REQUEST_COUNT = Counter(
+    "http_requests_total",
+    "Total number of HTTP requests",
+    ["method", "endpoint", "status"],
+)
+
+REQUEST_DURATION = Histogram(
+    "http_request_duration_seconds",
+    "HTTP request processing time in seconds",
+    ["method", "endpoint"],
+)
+
+# метрики для мониторинга сервисов
+
+SERVICE_UP = Gauge(
+    "monitored_service_up",
+    "Whether the monitored service is available (1 = up, 0 = down)",
+    ["service_id", "service_name"],
+)
+
+SERVICE_RESPONSE_TIME = Gauge(
+    "monitored_service_response_time_seconds",
+    "Response time of the last service check in seconds",
+    ["service_id", "service_name"],
+)
+
+SERVICE_HTTP_STATUS = Gauge(
+    "monitored_service_http_status_code",
+    "HTTP status code returned by the last check; 0 if unavailable",
+    ["service_id", "service_name"],
+)
+
+SERVICE_CHECKS_TOTAL = Counter(
+    "monitored_service_checks",
+    "Total number of checks performed on monitored services",
+    ["service_id", "service_name", "status"],
+)
+
+
+@app.middleware("http")
+async def collect_http_metrics(request: Request, call_next):
+    started_at = time.perf_counter()
+
+    response = await call_next(request)
+
+    route = request.scope.get("route")
+    endpoint = route.path if route else "unmatched"
+
+    REQUEST_COUNT.labels(
+        method=request.method,
+        endpoint=endpoint,
+        status=str(response.status_code),
+    ).inc()
+
+    REQUEST_DURATION.labels(
+        method=request.method,
+        endpoint=endpoint,
+    ).observe(time.perf_counter() - started_at)
+
+    return response
 
 
 class ServiceCreate(BaseModel):
@@ -55,7 +134,7 @@ def check_url(url: str, timeout: float = 5.0) -> dict:
         "error": None,
     }
 
-    request = Request(
+    request = URLRequest(
         url,
         headers={"User-Agent": "ServiceMonitor/1.0"},
         method="GET",
@@ -88,6 +167,103 @@ def check_url(url: str, timeout: float = 5.0) -> dict:
 
     return result
 
+
+def run_scheduled_checks():
+    """Check all registered services every five minutes."""
+    logger.info("Starting scheduled service checks")
+
+    db = SessionLocal()
+
+    try:
+        # сохранение данных сервисов в список
+        services = db.scalars(
+            select(Service).order_by(Service.id)
+        ).all()
+
+        services_data = [
+            (service.id, service.name, service.url)
+            for service in services
+        ]
+
+        for service_id, service_name, service_url in services_data:
+            try:
+                result = check_url(service_url)
+
+                labels = {
+                    "service_id": str(service_id),
+                    "service_name": service_name,
+                }
+
+                # обновляет метрики prometheus
+                SERVICE_UP.labels(**labels).set(
+                    1 if result["status"] == "OK" else 0
+                )
+
+                SERVICE_RESPONSE_TIME.labels(**labels).set(
+                    (result["response_time_ms"] or 0) / 1000
+                )
+
+                SERVICE_HTTP_STATUS.labels(**labels).set(
+                    result["http_status"] or 0
+                )
+
+                SERVICE_CHECKS_TOTAL.labels(
+                    **labels,
+                    status=result["status"],
+                ).inc()
+
+                # сохраняем результат проверки в sql
+                db.add(
+                    CheckResult(
+                        service_id=service_id,
+                        **result,
+                    )
+                )
+                db.commit()
+
+                logger.info(
+                    "Checked %s: %s",
+                    service_name,
+                    result["status"],
+                )
+
+            except Exception:
+                db.rollback()
+                logger.exception(
+                    "Failed to process check for service %s",
+                    service_name,
+                )
+
+    finally:
+        db.close()
+
+    logger.info("Scheduled service checks completed")
+
+
+scheduler.add_job(
+    run_scheduled_checks,
+    trigger="interval",
+    seconds=60,
+    id="service_checks",
+    replace_existing=True,
+    max_instances=1,
+    coalesce=True,
+)
+
+
+@app.on_event("startup")
+def start_scheduler():
+    if not scheduler.running:
+        scheduler.start()
+        logger.info("Scheduler started: checks every 60 seconds")
+
+
+@app.on_event("shutdown")
+def stop_scheduler():
+    if scheduler.running:
+        scheduler.shutdown(wait=False)
+        logger.info("Scheduler stopped")
+        
 
 def service_to_dict(service: Service) -> dict:
     return {
@@ -171,6 +347,29 @@ def check_service(
         )
 
     result = check_url(service.url)
+    
+    # инфо о метриках при каждом чеке
+    labels = {
+        "service_id": str(service.id),
+        "service_name": service.name,
+    }
+
+    SERVICE_UP.labels(**labels).set(
+        1 if result["status"] == "OK" else 0
+    )
+
+    SERVICE_RESPONSE_TIME.labels(**labels).set(
+        result["response_time_ms"] / 1000
+    )
+
+    SERVICE_HTTP_STATUS.labels(**labels).set(
+        result["http_status"] or 0
+    )
+
+    SERVICE_CHECKS_TOTAL.labels(
+        **labels,
+        status=result["status"],
+    ).inc()
 
     check_record = CheckResult(
         service_id=service.id,
@@ -208,3 +407,11 @@ def list_service_checks(
     ).all()
 
     return [check_to_dict(result) for result in results]
+
+
+@app.get("/metrics", include_in_schema=False)
+def metrics():
+    return Response(
+        content=generate_latest(),
+        media_type=CONTENT_TYPE_LATEST,
+    )

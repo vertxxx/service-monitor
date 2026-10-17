@@ -6,3 +6,6 @@ pydantic-settings
 pytest
 httpx
 python-dotenv
+prometheus-client
+APScheduler<4
+requests
